@@ -997,3 +997,78 @@ func BenchmarkWalk(b *testing.B) {
 		walkDir(testFs, "/", nil, nil, 0)
 	}
 }
+
+// failFinalRenameFS wraps a filesystem and fails renames to a specific target,
+// simulating the failure from https://github.com/syncthing/syncthing/issues/10895
+// where the second rename of the normalization temp file fails. It also
+// simulates a normalization-insensitive filesystem: Lstat of the normalized
+// name reports the same file as the stored name, so the temp-file rename path
+// in applyNormalization is taken.
+type failFinalRenameFS struct {
+	fs.Filesystem
+	nfdName    string
+	failTarget string
+}
+
+func (f *failFinalRenameFS) Lstat(name string) (fs.FileInfo, error) {
+	if name == f.failTarget {
+		return f.Filesystem.Lstat(f.nfdName)
+	}
+	return f.Filesystem.Lstat(name)
+}
+
+func (f *failFinalRenameFS) SameFile(_, _ fs.FileInfo) bool {
+	return true
+}
+
+func (f *failFinalRenameFS) Rename(oldpath, newpath string) error {
+	if newpath == f.failTarget {
+		return errors.New("file does not exist")
+	}
+	return f.Filesystem.Rename(oldpath, newpath)
+}
+
+// TestApplyNormalizationRollsBackOnFailure verifies that when the rename to
+// the normalized name fails, the file is rolled back to its original name and
+// an error is returned (surfacing as a folder error), instead of the file
+// being left renamed to the temporary name and indexed under it.
+func TestApplyNormalizationRollsBackOnFailure(t *testing.T) {
+	testFs := newTestFs()
+
+	const (
+		nfdName = "file-\x41\xCC\x88" // NFD 'Ä'
+		nfcName = "file-\xC3\x84"     // NFC 'Ä'
+	)
+	if err := fs.WriteFile(testFs, nfdName, []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := &walker{
+		Config: Config{
+			Filesystem: &failFinalRenameFS{Filesystem: testFs, nfdName: nfdName, failTarget: nfcName},
+		},
+	}
+	info, err := testFs.Lstat(nfdName)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := w.applyNormalization(nfdName, nfcName, info); err == nil {
+		t.Fatal("expected an error when the final rename fails")
+	}
+
+	// The file must be back under its original name...
+	if _, err := testFs.Lstat(nfdName); err != nil {
+		t.Errorf("original file %q missing after rollback: %v", nfdName, err)
+	}
+	// ...and no temp file may be left behind.
+	names, err := testFs.DirNames(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		if strings.HasSuffix(name, ".tmp") {
+			t.Errorf("temp file %q left behind after failed normalization", name)
+		}
+	}
+}
